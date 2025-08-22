@@ -1,11 +1,19 @@
 # main.py
 # Fireblocks -> Telegram webhook (FastAPI)
-# Adds: dual RSA verify (PKCS1v15 & PSS), alt signature header, robust payload parsing, simple logging.
+# - Root route (/) so Railway health checks won't 404
+# - Health route (/healthz)
+# - Webhook route (/fireblocks/webhook)
+# - Dual RSA verification (PKCS1v15 and PSS) + alt signature headers
+# - Simple logs and optional Telegram debug pings
 
-import base64, json, hmac
+import base64
+import json
+import hmac
 import logging
+
 from fastapi import FastAPI, Request, Header, HTTPException
 import httpx
+
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.exceptions import InvalidSignature
@@ -13,11 +21,11 @@ from cryptography.exceptions import InvalidSignature
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-# ─── Telegram bot credentials ───────────────────────────────
+# ─── Telegram bot credentials (YOURS) ─────────────────────────
 TELEGRAM_BOT_TOKEN = "8267279608:AAEgyQ0bJO338F1Is34IXZ7unAl1khpt2qI"
 TELEGRAM_CHAT_ID   = "54380770"
 
-# ─── Fireblocks Stage public key (PEM format) ────────────────
+# ─── Fireblocks Stage public key (PEM) ────────────────────────
 FIREBLOCKS_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw+fZuC+0vDYTf8fYnCN6
 71iHg98lPHBmafmqZqb+TUexn9sH6qNIBZ5SgYFxFK6dYXIuJ5uoORzihREvZVZP
@@ -28,29 +36,29 @@ WxFMfGyDCX2akEg2aAvx7231/6S0vBFGiX0C+3GbXlieHDplLGoODHUt5hxbPJnK
 IwIDAQAB
 -----END PUBLIC KEY-----"""
 
-# ─── Shared secret (leave blank if not used) ────────────────
+# ─── Optional shared-secret (leave blank if unused) ───────────
 FIREBLOCKS_WEBHOOK_SECRET = ""
 
-# ─── Controls ───────────────────────────────────────────────
-ALLOW_UNVERIFIED = False    # set True only for quick tests
-DEBUG_TO_TELEGRAM = False   # set True to receive small debug pings on every hit
+# ─── Controls ─────────────────────────────────────────────────
+ALLOW_UNVERIFIED = True     # <<< set to False after testing to enforce signature checks
+DEBUG_TO_TELEGRAM = False   # set to True to get tiny debug pings on every webhook hit
 
 
-# ─────────────────────────── Helpers ─────────────────────────
-def _verify_rsa(raw_body: bytes, signature_b64: str, public_key_pem: str) -> bool:
-    """Try PKCS1v15 first, then PSS (both SHA-512)."""
+# ─────────────────────────── Helpers ──────────────────────────
+def verify_rsa(raw_body: bytes, signature_b64: str, public_key_pem: str) -> bool:
+    """Try RSA PKCS1v15 first, then RSA-PSS (both SHA-512)."""
     try:
         public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
         signature = base64.b64decode(signature_b64)
 
-        # Try PKCS1v15
+        # Attempt PKCS1v15
         try:
             public_key.verify(signature, raw_body, padding.PKCS1v15(), hashes.SHA512())
             return True
         except InvalidSignature:
             pass
 
-        # Try PSS (MGF1 SHA-512, salt length = hash size)
+        # Attempt PSS
         try:
             public_key.verify(
                 signature,
@@ -61,26 +69,21 @@ def _verify_rsa(raw_body: bytes, signature_b64: str, public_key_pem: str) -> boo
             return True
         except InvalidSignature:
             return False
-
     except Exception:
         return False
 
-def _verify_shared_secret(provided_secret: str, configured_secret: str) -> bool:
+def verify_shared_secret(provided_secret: str, configured_secret: str) -> bool:
     return hmac.compare_digest((provided_secret or "").strip(), (configured_secret or "").strip())
 
-async def _telegram(text: str):
+async def send_to_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"})
 
-def _coalesce_event(payload: dict) -> dict:
-    """
-    Normalize common Fireblocks payload shapes:
-      - Top-level: {"type": "...", "status": "...", ...}
-      - Nested: {"type": "...", "data": {...}} or {"eventType": "...", "tx": {...}}
-    """
+def coalesce_event(payload: dict) -> dict:
+    """Normalize common Fireblocks payload shapes (top-level or nested under 'data'/'tx')."""
     if not isinstance(payload, dict):
         return {}
 
@@ -93,7 +96,7 @@ def _coalesce_event(payload: dict) -> dict:
     src      = payload.get("source") or payload.get("from")
     dst      = payload.get("destination") or payload.get("to")
 
-    # If missing, search common nests
+    # Check common nests
     data = payload.get("data") or payload.get("tx") or {}
     if isinstance(data, dict):
         evt_type = evt_type or data.get("type")
@@ -114,7 +117,7 @@ def _coalesce_event(payload: dict) -> dict:
         "dst": dst or "",
     }
 
-def _format_event(norm: dict) -> str:
+def format_event(norm: dict) -> str:
     lines = [f"<b>Fireblocks:</b> {norm.get('evt_type','fireblocks_event')}"]
     if norm.get("tx_id"):   lines.append(f"Tx: <code>{norm['tx_id']}</code>")
     if norm.get("status"):  lines.append(f"Status: <b>{norm['status']}</b>")
@@ -125,11 +128,7 @@ def _format_event(norm: dict) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────── Routes ──────────────────────────
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
+# ─────────────────────────── Routes ───────────────────────────
 @app.get("/")
 async def root():
     return {
@@ -137,47 +136,52 @@ async def root():
         "service": "Fireblocks → Telegram webhook",
         "health": "/healthz",
         "webhook": "/fireblocks/webhook",
+        "verification": "skipped" if ALLOW_UNVERIFIED else "rsa/secret"
     }
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 @app.post("/fireblocks/webhook")
 async def fireblocks_webhook(
     request: Request,
     # Accept either header variant
-    fireblocks_signature: str | None = Header(default=None, convert_underscores=False),        # "Fireblocks-Signature"
-    x_fireblocks_signature: str | None = Header(default=None, convert_underscores=False),       # "X-Fireblocks-Signature"
-    x_webhook_secret: str | None = Header(default=None, convert_underscores=False),             # "X-Webhook-Secret" (if used)
+    fireblocks_signature: str | None = Header(default=None, convert_underscores=False),   # "Fireblocks-Signature"
+    x_fireblocks_signature: str | None = Header(default=None, convert_underscores=False), # "X-Fireblocks-Signature"
+    x_webhook_secret: str | None = Header(default=None, convert_underscores=False),       # "X-Webhook-Secret" (if used)
 ):
     raw = await request.body()
 
-    # Pull whichever signature header exists
-    sig = fireblocks_signature or x_fireblocks_signature
+    # Signature verification
     verified = False
+    signature_b64 = fireblocks_signature or x_fireblocks_signature
 
-    # 1) RSA signature verification (preferred)
-    if FIREBLOCKS_PUBLIC_KEY_PEM.strip() and sig:
-        verified = _verify_rsa(raw, sig, FIREBLOCKS_PUBLIC_KEY_PEM)
+    # 1) RSA verification (preferred)
+    if FIREBLOCKS_PUBLIC_KEY_PEM.strip() and signature_b64:
+        verified = verify_rsa(raw, signature_b64, FIREBLOCKS_PUBLIC_KEY_PEM)
 
-    # 2) Fallback: shared secret, if configured
+    # 2) Shared-secret fallback
     if not verified and FIREBLOCKS_WEBHOOK_SECRET.strip():
-        verified = _verify_shared_secret(x_webhook_secret, FIREBLOCKS_WEBHOOK_SECRET)
+        verified = verify_shared_secret(x_webhook_secret, FIREBLOCKS_WEBHOOK_SECRET)
 
-    # 3) Stage override
+    # 3) Allow bypass in stage for quick sanity
     if not verified and not ALLOW_UNVERIFIED:
         logging.warning("Webhook rejected: signature/secret verification failed")
         raise HTTPException(status_code=401, detail="Signature/secret verification failed")
 
-    # Parse payload
+    # Parse and format
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
         payload = {}
 
-    norm = _coalesce_event(payload)
-    msg = _format_event(norm)
+    norm = coalesce_event(payload)
+    msg = format_event(norm) if norm else "New Fireblocks event"
 
     logging.info(f"Webhook OK: type={norm.get('evt_type')} tx={norm.get('tx_id')} status={norm.get('status')}")
     if DEBUG_TO_TELEGRAM:
-        await _telegram(f"DEBUG: received {norm.get('evt_type')} / {norm.get('tx_id')}")
+        await send_to_telegram(f"DEBUG: received {norm.get('evt_type')} / {norm.get('tx_id')}")
 
-    await _telegram(msg or "New Fireblocks event")
+    await send_to_telegram(msg)
     return {"ok": True}
