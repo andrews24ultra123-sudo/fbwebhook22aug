@@ -1,14 +1,19 @@
 # main.py
 # Fireblocks -> Telegram webhook (FastAPI)
-# - Custom alerts:
-#   * ETH_TEST5 + To=Internal Wallet N/A (id starts bac86fcc-...) => QCDT MINT/BURN message
-#   * QCDT_B75VRLGX_QIBD + To=One Time Address N/A => QCDT WITHDRAWAL message
+# - Mint/Burn alert:
+#     * asset in MINT_ASSET_IDS (env, defaults to ETH_TEST5)
+#     * To = Internal Wallet (name "N/A")
+#     * If QCDT_INTERNAL_WALLET_IDS env is set (comma-separated), destination wallet id must start with one of those
+# - Withdrawal alert:
+#     * asset in QCDT_TOKEN_IDS (env, defaults to QCDT_B75VRLGX_QIBD)
+#     * To = One Time Address (name "N/A")
+#     * Amount shown with QCDT_DISPLAY_SYMBOL (env, defaults to "QCDT")
 # - Filters out events with "op@fundadmin.com"
 # - Uses FULL Fireblocks Transaction ID
 # - Root + health endpoints included
 # - Dual RSA verification (PKCS1v15 & PSS) + alt signature headers
 
-import base64, json, hmac, logging
+import base64, json, hmac, logging, os
 from fastapi import FastAPI, Request, Header, HTTPException
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -20,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 
 # ─── Telegram bot credentials ────────────────────────────────
 TELEGRAM_BOT_TOKEN = "8267279608:AAEgyQ0bJO338F1Is34IXZ7unAl1khpt2qI"
-TELEGRAM_CHAT_ID   = "-4680966417"   # your group chat id
+TELEGRAM_CHAT_ID   = "-4680966417"   # group chat id
 
 # ─── Fireblocks Stage public key (PEM) ────────────────────────
 FIREBLOCKS_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
@@ -36,10 +41,23 @@ IwIDAQAB
 # ─── Optional shared-secret (leave blank if unused) ───────────
 FIREBLOCKS_WEBHOOK_SECRET = ""
 
-# ─── Controls ─────────────────────────────────────────────────
-ALLOW_UNVERIFIED = True      # flip to False once you’re done testing
+# ─── Controls & Filters ───────────────────────────────────────
+ALLOW_UNVERIFIED = True      # flip to False for production
 FILTER_NAME_BLOCKLIST = {"op@fundadmin.com"}  # suppress by From/To name
-QCDT_INTERNAL_WALLET_ID = "bac86fcc-c41e-404f-8efb-acb1a90a0a3c"   # internal wallet id
+
+# Assets & IDs made configurable via env
+# - QCDT_TOKEN_IDS: comma-separated list of your token identifiers (e.g. "QCDT_B75VRLGX_QIBD,NEW_TOKEN_ABC")
+# - QCDT_DISPLAY_SYMBOL: how to print the token in messages (default "QCDT")
+# - MINT_ASSET_IDS: assets that represent the on-chain funding leg for mint/burn (default "ETH_TEST5")
+# - QCDT_INTERNAL_WALLET_IDS: optional comma-separated internal wallet id/prefixes to restrict the mint rule
+def _parse_csv_env(name: str, default: str = ""):
+    raw = os.getenv(name, default).strip()
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+QCDT_TOKEN_IDS       = [a.upper() for a in _parse_csv_env("QCDT_TOKEN_IDS", "QCDT_B75VRLGX_QIBD")]
+QCDT_DISPLAY_SYMBOL  = os.getenv("QCDT_DISPLAY_SYMBOL", "QCDT").strip() or "QCDT"
+MINT_ASSET_IDS       = [a.upper() for a in _parse_csv_env("MINT_ASSET_IDS", "ETH_TEST5")]
+ALLOWED_INT_WALLET_IDS = _parse_csv_env("QCDT_INTERNAL_WALLET_IDS", "")  # keep original casing; we do startswith
 
 # ─────────────────────────── Utils ────────────────────────────
 def escape_html(s: str) -> str:
@@ -56,19 +74,24 @@ def fmt_amount(x):
         return str(x)
 
 def verify_rsa(raw_body: bytes, signature_b64: str, public_key_pem: str) -> bool:
+    """Try RSA PKCS1v15 first, then RSA-PSS (both SHA-512)."""
     try:
         public_key = serialization.load_pem_public_key(public_key_pem.encode())
         signature = base64.b64decode(signature_b64)
         try:
-            public_key.verify(signature, raw_body, padding.PKCS1v15(), hashes.SHA512()); return True
-        except InvalidSignature: pass
+            public_key.verify(signature, raw_body, padding.PKCS1v15(), hashes.SHA512())
+            return True
+        except InvalidSignature:
+            pass
         public_key.verify(
-            signature, raw_body,
+            signature,
+            raw_body,
             padding.PSS(mgf=padding.MGF1(hashes.SHA512()), salt_length=hashes.SHA512().digest_size),
-            hashes.SHA512()
+            hashes.SHA512(),
         )
         return True
-    except Exception: return False
+    except Exception:
+        return False
 
 def verify_shared_secret(provided, configured):
     return hmac.compare_digest((provided or "").strip(), (configured or "").strip())
@@ -89,7 +112,7 @@ def coalesce_event(payload: dict) -> dict:
     if not isinstance(payload, dict): return {}
     evt_type = payload.get("type") or payload.get("eventType")
     status   = payload.get("status") or payload.get("txStatus")
-    tx_id    = payload.get("id") or payload.get("transactionId")
+    tx_id    = payload.get("id") or payload.get("transactionId")  # full FB tx id
     asset    = payload.get("assetId") or payload.get("asset") or payload.get("currency")
     amount   = payload.get("amount") or payload.get("value")
     src      = payload.get("source") or payload.get("from")
@@ -121,10 +144,35 @@ def should_suppress_by_name(norm: dict) -> bool:
             return True
     return False
 
+def match_internal_wallet(dst_type: str, dst_name: str, dst_id_full: str) -> bool:
+    """
+    True if destination matches your internal wallet rule for mint/burn:
+      - type INTERNAL_WALLET
+      - name "N/A"
+      - if ALLOWED_INT_WALLET_IDS provided: dst_id_full startswith any allowed ID
+      - if none provided: accept ANY internal wallet named "N/A"
+    """
+    if (dst_type or "").upper() != "INTERNAL_WALLET":
+        return False
+    if (dst_name or "") != "N/A":
+        return False
+    if not ALLOWED_INT_WALLET_IDS:
+        return True
+    did = dst_id_full or ""
+    return any(did.startswith(allow) for allow in ALLOWED_INT_WALLET_IDS)
+
 # ─────────────────────────── Routes ───────────────────────────
 @app.get("/")
 async def root():
-    return {"ok": True, "webhook": "/fireblocks/webhook"}
+    return {
+        "ok": True,
+        "webhook": "/fireblocks/webhook",
+        "verification": "skipped" if ALLOW_UNVERIFIED else "rsa/secret",
+        "mint_assets": MINT_ASSET_IDS,
+        "qcdt_token_ids": QCDT_TOKEN_IDS,
+        "qcdt_symbol": QCDT_DISPLAY_SYMBOL,
+        "allowed_internal_wallet_ids": ALLOWED_INT_WALLET_IDS or "ANY (name='N/A')",
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -155,7 +203,7 @@ async def fireblocks_webhook(
         logging.info(f"Suppressed: name blocklist hit tx={norm.get('tx_id')}")
         return {"ok": True, "suppressed": "name_blocklist"}
 
-    asset = (norm.get("asset") or "").upper()
+    asset_upper = (norm.get("asset") or "").upper()
     investor = norm.get("src_name") or norm.get("dst_name") or "Unknown"
     tx_id = norm.get("tx_id") or ""
     dst_type = (norm.get("dst_type") or "").upper()
@@ -163,14 +211,8 @@ async def fireblocks_webhook(
     dst_id_full = norm.get("dst_id_full") or ""
     amount_str = fmt_amount(norm.get("amount"))
 
-    # Rule 1: ETH_TEST5 → Internal Wallet N/A
-    is_eth_test5_to_internal = (
-        asset == "ETH_TEST5"
-        and dst_type == "INTERNAL_WALLET"
-        and dst_name == "N/A"
-        and (dst_id_full.startswith(QCDT_INTERNAL_WALLET_ID) or dst_id_full == QCDT_INTERNAL_WALLET_ID)
-    )
-    if is_eth_test5_to_internal:
+    # Rule 1: MINT/BURN (funding leg) → Internal Wallet
+    if asset_upper in MINT_ASSET_IDS and match_internal_wallet(dst_type, dst_name, dst_id_full):
         msg = (
             "⏰ Fireblocks QCDT MINT/BURN Transaction Detected \n"
             f"Investor: {escape_html(investor)}\n"
@@ -181,14 +223,9 @@ async def fireblocks_webhook(
         await send_to_telegram(msg)
         return {"ok": True, "alert": "mint_burn"}
 
-    # Rule 2: QCDT_B75VRLGX_QIBD → One Time Address N/A
-    is_qcdt_withdrawal = (
-        asset == "QCDT_B75VRLGX_QIBD"
-        and dst_type == "ONE_TIME_ADDRESS"
-        and dst_name == "N/A"
-    )
-    if is_qcdt_withdrawal:
-        pretty_amount = f"{amount_str} QCDT" if amount_str else "QCDT"
+    # Rule 2: QCDT Withdrawal → One Time Address "N/A"
+    if (asset_upper in QCDT_TOKEN_IDS) and dst_type == "ONE_TIME_ADDRESS" and dst_name == "N/A":
+        pretty_amount = f"{amount_str} {QCDT_DISPLAY_SYMBOL}" if amount_str else QCDT_DISPLAY_SYMBOL
         msg = (
             "⏰ Fireblocks QCDT Withdrawal Request Detected \n"
             f"Investor: {escape_html(investor)}\n"
@@ -200,5 +237,5 @@ async def fireblocks_webhook(
         await send_to_telegram(msg)
         return {"ok": True, "alert": "withdrawal"}
 
-    logging.info(f"Suppressed: no rule match asset={asset} dst={dst_type}/{dst_name} tx={tx_id}")
+    logging.info(f"Suppressed: no rule match asset={asset_upper} dst={dst_type}/{dst_name} tx={tx_id}")
     return {"ok": True, "suppressed": "no_rule_match"}
