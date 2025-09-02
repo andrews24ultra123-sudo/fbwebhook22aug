@@ -42,8 +42,7 @@ IwIDAQAB
 FIREBLOCKS_WEBHOOK_SECRET = ""
 
 # ─── Controls & Filters ───────────────────────────────────────
-ALLOW_UNVERIFIED   = True     # flip to False for production
-DEBUG_TO_TELEGRAM  = True     # <<< TEMP: set to False after confirming it works
+ALLOW_UNVERIFIED = True      # flip to False for production
 FILTER_NAME_BLOCKLIST = {"op@fundadmin.com"}  # suppress by From/To name
 
 # ─── Env-configurable assets & IDs ────────────────────────────
@@ -51,10 +50,10 @@ def _parse_csv_env(name: str, default: str = ""):
     raw = os.getenv(name, default).strip()
     return [s.strip() for s in raw.split(",") if s.strip()]
 
-# Default now uses a WILDCARD to match any QCDT id with that prefix
-QCDT_TOKEN_IDS       = [a.upper() for a in _parse_csv_env("QCDT_TOKEN_IDS", "QCDT_B75VRLGX_*")]
-QCDT_DISPLAY_SYMBOL  = os.getenv("QCDT_DISPLAY_SYMBOL", "QCDT").strip() or "QCDT"
-MINT_ASSET_IDS       = [a.upper() for a in _parse_csv_env("MINT_ASSET_IDS", "ETH_TEST5")]
+# Default includes wildcard to catch evolving ids, e.g. QCDT_B75VRLGX_0XTS
+QCDT_TOKEN_IDS         = [a.upper() for a in _parse_csv_env("QCDT_TOKEN_IDS", "QCDT_B75VRLGX_*")]
+QCDT_DISPLAY_SYMBOL    = os.getenv("QCDT_DISPLAY_SYMBOL", "QCDT").strip() or "QCDT"
+MINT_ASSET_IDS         = [a.upper() for a in _parse_csv_env("MINT_ASSET_IDS", "ETH_TEST5")]
 ALLOWED_INT_WALLET_IDS = _parse_csv_env("QCDT_INTERNAL_WALLET_IDS", "")
 
 # ─────────────────────────── Utils ────────────────────────────
@@ -183,25 +182,19 @@ async def fireblocks_webhook(
     except Exception: payload = {}
     norm = coalesce_event(payload)
 
-    # DEBUG: always show what we parsed
-    dbg = f"DEBUG: asset={norm.get('asset')} dst_type={norm.get('dst_type')} dst_name={norm.get('dst_name')} tx={norm.get('tx_id')}"
-    logging.info(dbg)
-    if DEBUG_TO_TELEGRAM:
-        await telegram(dbg)
-
     if should_suppress_by_name(norm):
         logging.info(f"Suppressed: name blocklist hit tx={norm.get('tx_id')}")
         return {"ok": True, "suppressed": "name_blocklist"}
 
     asset_upper = (norm.get("asset") or "").upper()
-    investor = norm.get("src_name") or norm.get("dst_name") or "Unknown"
-    tx_id = norm.get("tx_id") or ""
-    dst_type = (norm.get("dst_type") or "").upper()
-    dst_name = norm.get("dst_name") or ""
+    investor    = norm.get("src_name") or norm.get("dst_name") or "Unknown"
+    tx_id       = norm.get("tx_id") or ""
+    dst_type    = (norm.get("dst_type") or "").upper()
+    dst_name    = norm.get("dst_name") or ""
     dst_id_full = norm.get("dst_id_full") or ""
-    amount_str = fmt_amount(norm.get("amount"))
+    amount_str  = fmt_amount(norm.get("amount"))
 
-    # Rule 1: MINT/BURN (funding leg) → Internal Wallet
+    # Mint/Burn rule (funding leg -> Internal Wallet "N/A")
     if asset_upper in MINT_ASSET_IDS and match_internal_wallet(dst_type, dst_name, dst_id_full):
         msg = (
             "⏰ Fireblocks QCDT MINT/BURN Transaction Detected \n"
@@ -213,16 +206,10 @@ async def fireblocks_webhook(
         await telegram(msg)
         return {"ok": True, "alert": "mint_burn"}
 
-    # Rule 2: QCDT Withdrawal → One Time Address (name may be 'N/A' or empty)
+    # Withdrawal rule (QCDT token -> One Time Address)
     one_time_types = {"ONE_TIME_ADDRESS", "ONE_TIME"}
     name_is_na_or_blank = (dst_name == "N/A") or (dst_name.strip() == "")
-    qcdt_match = token_matches(asset_upper, QCDT_TOKEN_IDS)
-    dst_match  = (dst_type in one_time_types) and name_is_na_or_blank
-
-    if DEBUG_TO_TELEGRAM:
-        await telegram(f"DEBUG: token_match={qcdt_match} dst_match={dst_match} patterns={QCDT_TOKEN_IDS}")
-
-    if qcdt_match and dst_match:
+    if token_matches(asset_upper, QCDT_TOKEN_IDS) and (dst_type in one_time_types) and name_is_na_or_blank:
         pretty_amount = f"{amount_str} {QCDT_DISPLAY_SYMBOL}" if amount_str else QCDT_DISPLAY_SYMBOL
         msg = (
             "⏰ Fireblocks QCDT Withdrawal Request Detected \n"
@@ -236,6 +223,4 @@ async def fireblocks_webhook(
         return {"ok": True, "alert": "withdrawal"}
 
     logging.info(f"Suppressed: no rule match asset={asset_upper} dst={dst_type}/{dst_name} tx={tx_id}")
-    if DEBUG_TO_TELEGRAM:
-        await telegram("DEBUG: no rule match (see logs)")
     return {"ok": True, "suppressed": "no_rule_match"}
