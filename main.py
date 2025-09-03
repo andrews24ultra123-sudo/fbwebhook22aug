@@ -1,17 +1,5 @@
 # main.py
 # Fireblocks -> Telegram webhook (FastAPI)
-# - Mint/Burn alert:
-#     * asset in MINT_ASSET_IDS (env, defaults to ETH_TEST5)
-#     * To = Internal Wallet (name "N/A")
-#     * If QCDT_INTERNAL_WALLET_IDS env is set, wallet id must start with one of those
-# - Withdrawal alert:
-#     * asset in QCDT_TOKEN_IDS (supports wildcard suffix "*", e.g. QCDT_B75VRLGX_*)
-#     * To = One Time Address (accepts type ONE_TIME_ADDRESS or ONE_TIME; name "N/A" or empty)
-#     * Amount shown with QCDT_DISPLAY_SYMBOL (env, defaults to "QCDT")
-# - Filters out events with "op@fundadmin.com"
-# - Uses FULL Fireblocks Transaction ID
-# - Root + health endpoints included
-# - Dual RSA verification (PKCS1v15 & PSS)
 
 import base64, json, hmac, logging, os
 from fastapi import FastAPI, Request, Header, HTTPException
@@ -38,19 +26,16 @@ WxFMfGyDCX2akEg2aAvx7231/6S0vBFGiX0C+3GbXlieHDplLGoODHUt5hxbPJnK
 IwIDAQAB
 -----END PUBLIC KEY-----"""
 
-# ─── Optional shared-secret (leave blank if unused) ───────────
 FIREBLOCKS_WEBHOOK_SECRET = ""
 
 # ─── Controls & Filters ───────────────────────────────────────
-ALLOW_UNVERIFIED = True      # flip to False for production
-FILTER_NAME_BLOCKLIST = {"op@fundadmin.com"}  # suppress by From/To name
+ALLOW_UNVERIFIED = True
+FILTER_NAME_BLOCKLIST = {"op@fundadmin.com", "DMZ_UAT_Signer"}
 
-# ─── Env-configurable assets & IDs ────────────────────────────
 def _parse_csv_env(name: str, default: str = ""):
     raw = os.getenv(name, default).strip()
     return [s.strip() for s in raw.split(",") if s.strip()]
 
-# Default includes wildcard to catch evolving ids, e.g. QCDT_B75VRLGX_0XTS
 QCDT_TOKEN_IDS         = [a.upper() for a in _parse_csv_env("QCDT_TOKEN_IDS", "QCDT_B75VRLGX_*")]
 QCDT_DISPLAY_SYMBOL    = os.getenv("QCDT_DISPLAY_SYMBOL", "QCDT").strip() or "QCDT"
 MINT_ASSET_IDS         = [a.upper() for a in _parse_csv_env("MINT_ASSET_IDS", "ETH_TEST5")]
@@ -85,8 +70,6 @@ def verify_shared_secret(provided, configured):
     return hmac.compare_digest((provided or "").strip(), (configured or "").strip())
 
 async def telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=10) as c:
         await c.post(url, json={"chat_id": TELEGRAM_CHAT_ID,"text": text,"parse_mode":"HTML"})
@@ -133,7 +116,6 @@ def match_internal_wallet(dst_type: str, dst_name: str, dst_id_full: str) -> boo
     return any((dst_id_full or "").startswith(allow) for allow in ALLOWED_INT_WALLET_IDS)
 
 def token_matches(asset: str, patterns: list[str]) -> bool:
-    """Allow exact or prefix match if pattern ends with '*'."""
     a = (asset or "").upper()
     for p in patterns:
         pu = p.upper()
@@ -145,22 +127,6 @@ def token_matches(asset: str, patterns: list[str]) -> bool:
     return False
 
 # ─────────────────────────── Routes ───────────────────────────
-@app.get("/")
-async def root():
-    return {
-        "ok": True,
-        "webhook": "/fireblocks/webhook",
-        "verification": "skipped" if ALLOW_UNVERIFIED else "rsa/secret",
-        "mint_assets": MINT_ASSET_IDS,
-        "qcdt_token_ids": QCDT_TOKEN_IDS,
-        "qcdt_symbol": QCDT_DISPLAY_SYMBOL,
-        "allowed_internal_wallet_ids": ALLOWED_INT_WALLET_IDS or "ANY (name='N/A')",
-    }
-
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
 @app.post("/fireblocks/webhook")
 async def fireblocks_webhook(
     request: Request,
@@ -183,8 +149,7 @@ async def fireblocks_webhook(
     norm = coalesce_event(payload)
 
     if should_suppress_by_name(norm):
-        logging.info(f"Suppressed: name blocklist hit tx={norm.get('tx_id')}")
-        return {"ok": True, "suppressed": "name_blocklist"}
+        return {"ok": True, "suppressed": "blocklist"}
 
     asset_upper = (norm.get("asset") or "").upper()
     investor    = norm.get("src_name") or norm.get("dst_name") or "Unknown"
@@ -194,19 +159,19 @@ async def fireblocks_webhook(
     dst_id_full = norm.get("dst_id_full") or ""
     amount_str  = fmt_amount(norm.get("amount"))
 
-    # Mint/Burn rule (funding leg -> Internal Wallet "N/A")
+    # Mint/Burn rule
     if asset_upper in MINT_ASSET_IDS and match_internal_wallet(dst_type, dst_name, dst_id_full):
         msg = (
             "⏰ Fireblocks QCDT MINT/BURN Transaction Detected \n"
             f"Investor: {escape_html(investor)}\n"
             f"Tx: {escape_html(tx_id)}\n\n"
-            "Action: Fund Admin to review and approve Investor's mint/burn request on DMZ portal, "
-            "followed by approving mint/burn on Fireblocks app."
+            "Action: Fund Admin Maker to review and approve Investor's mint/burn request on DMZ Maker Portal, "
+            "followed by approving mint/burn on Fireblocks App."
         )
         await telegram(msg)
         return {"ok": True, "alert": "mint_burn"}
 
-    # Withdrawal rule (QCDT token -> One Time Address)
+    # Withdrawal rule (updated action text)
     one_time_types = {"ONE_TIME_ADDRESS", "ONE_TIME"}
     name_is_na_or_blank = (dst_name == "N/A") or (dst_name.strip() == "")
     if token_matches(asset_upper, QCDT_TOKEN_IDS) and (dst_type in one_time_types) and name_is_na_or_blank:
@@ -216,11 +181,10 @@ async def fireblocks_webhook(
             f"Investor: {escape_html(investor)}\n"
             f"Amount: {escape_html(pretty_amount)}\n"
             f"Tx: {escape_html(tx_id)}\n\n"
-            "Action: Fund Admin to review and approve Investor's QCDT withdrawal request. "
-            "To check investor's destination address on Fireblocks App before approving."
+            "Action: Fund Admin to review and approve Investor's QCDT withdrawal request on the Fireblocks App. "
+            "To check investor's destination address on the Fireblocks App before approving."
         )
         await telegram(msg)
         return {"ok": True, "alert": "withdrawal"}
 
-    logging.info(f"Suppressed: no rule match asset={asset_upper} dst={dst_type}/{dst_name} tx={tx_id}")
     return {"ok": True, "suppressed": "no_rule_match"}
